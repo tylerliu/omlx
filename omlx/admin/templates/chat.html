@@ -1282,6 +1282,7 @@
             // Model State
             availableModels: [],
             currentModel: null,
+            modelDisplayIdMap: {},       // { canonicalModelId: displayIdFromV1Models }
 
             // Streaming State
             streamSessions: {},
@@ -1313,6 +1314,7 @@
 
             // VLM Detection State
             modelTypeMap: {},            // { modelId: "llm"|"vlm"|"embedding"|"reranker" }
+            modelStatusModels: [],        // Canonical model metadata from /v1/models/status
 
             // System Prompt
             systemPrompt: localStorage.getItem('omlx_chat_system_prompt') || '',
@@ -1485,14 +1487,31 @@
             });
             if (!resp.ok) return;
             const data = await resp.json();
+            this.modelStatusModels = data.models || [];
             const map = {};
-            for (const m of (data.models || [])) {
+            for (const m of this.modelStatusModels) {
                 map[m.id] = m.model_type || 'llm';
             }
             this.modelTypeMap = map;
         } catch (e) {
             // Model status endpoint unavailable
         }
+    },
+
+    syncDisplayModelMetadata(displayModels) {
+        this.modelTypeMap = { ...this.modelTypeMap };
+        this.modelDisplayIdMap = {};
+        displayModels.forEach((displayModel, index) => {
+            const statusModel = this.modelStatusModels[index];
+            if (!statusModel) return;
+            this.modelTypeMap[displayModel.id] = statusModel.model_type || 'llm';
+            this.modelDisplayIdMap[statusModel.id] = displayModel.id;
+            this.modelDisplayIdMap[displayModel.id] = displayModel.id;
+        });
+    },
+
+    resolveDisplayModelId(modelId) {
+        return this.modelDisplayIdMap[modelId] || modelId;
     },
 
     hasVisionSupport() {
@@ -1770,6 +1789,7 @@
 
             // Fetch model types first (needed for filtering and VLM detection)
             await this.fetchModelTypes();
+            this.syncDisplayModelMetadata(allModels);
 
             // Filter out audio/embedding/reranker — chat only works with LLM/VLM
             this.availableModels = allModels.filter(m => {
@@ -1785,8 +1805,9 @@
 
             // Auto-select default model if set, otherwise first model
             if (!this.currentModel && this.availableModels.length > 0) {
-                if (defaultModel && this.availableModels.some(m => m.id === defaultModel)) {
-                    this.currentModel = defaultModel;
+                const defaultDisplayModel = defaultModel ? this.resolveDisplayModelId(defaultModel) : null;
+                if (defaultDisplayModel && this.availableModels.some(m => m.id === defaultDisplayModel)) {
+                    this.currentModel = defaultDisplayModel;
                 } else {
                     this.currentModel = this.availableModels[0].id;
                 }
