@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for ThinkingBudgetProcessor logits processor."""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -13,8 +13,11 @@ try:
 except ImportError:
     HAS_MLX = False
 
+from omlx.adapter.output_parser import OutputParserFactory
 from omlx.api.thinking import ThinkingBudgetProcessor
 from omlx.model_settings import ModelSettings
+from omlx.request import Request, SamplingParams
+from omlx.scheduler import Scheduler
 
 
 # ---------------------------------------------------------------------------
@@ -239,6 +242,126 @@ class TestModelSettingsThinkingBudget:
         settings = ModelSettings()
         d = settings.to_dict()
         assert "thinking_budget_tokens" not in d
+
+
+class TestParserBackedThinkingBudgetWiring:
+    """Scheduler wiring for parsers that own reasoning protocol markers."""
+
+    def _make_scheduler(self, factory, encode_map):
+        scheduler = MagicMock(spec=Scheduler)
+        scheduler._output_parser_factory = factory
+        scheduler._xtc_special_tokens = set()
+        scheduler._get_think_token_id = Scheduler._get_think_token_id.__get__(
+            scheduler, Scheduler
+        )
+        scheduler._get_output_parser_thinking_end_text = (
+            Scheduler._get_output_parser_thinking_end_text.__get__(scheduler, Scheduler)
+        )
+        scheduler._encode_thinking_marker = Scheduler._encode_thinking_marker.__get__(
+            scheduler, Scheduler
+        )
+        scheduler._resolve_output_parser_thinking_trailing_ids = (
+            Scheduler._resolve_output_parser_thinking_trailing_ids.__get__(
+                scheduler, Scheduler
+            )
+        )
+        scheduler._resolve_think_end_token_ids = (
+            Scheduler._resolve_think_end_token_ids.__get__(scheduler, Scheduler)
+        )
+        scheduler._resolve_think_close_pattern = MagicMock(return_value=(None, None))
+        scheduler._build_sampler_and_processors = (
+            Scheduler._build_sampler_and_processors.__get__(scheduler, Scheduler)
+        )
+
+        tokenizer = MagicMock()
+        tokenizer.encode.side_effect = lambda text, add_special_tokens=False: encode_map[
+            text
+        ]
+        scheduler.tokenizer = tokenizer
+        return scheduler
+
+    def _make_request(self):
+        request = Request(
+            request_id="parser-thinking-budget",
+            prompt="test",
+            sampling_params=SamplingParams(thinking_budget=512),
+            prompt_token_ids=[1, 2, 3],
+            num_prompt_tokens=3,
+        )
+        request.needs_think_prefix = False
+        return request
+
+    def test_gemma4_uses_parser_thinking_close_marker(self):
+        factory = OutputParserFactory(
+            kind="gemma4",
+            create_session=MagicMock(),
+            thinking_end_text="<channel|>",
+        )
+        scheduler = self._make_scheduler(factory, {"<channel|>": [101]})
+        request = self._make_request()
+
+        _, processors = scheduler._build_sampler_and_processors(
+            request.sampling_params, request
+        )
+
+        budget_processors = [
+            p for p in processors if isinstance(p, ThinkingBudgetProcessor)
+        ]
+        assert len(budget_processors) == 1
+        assert budget_processors[0]._think_end_ids == [101]
+
+    def test_parser_marker_ignores_none_tokenizer_think_end(self):
+        factory = OutputParserFactory(
+            kind="gemma4",
+            create_session=MagicMock(),
+            thinking_end_text="<channel|>",
+        )
+        scheduler = self._make_scheduler(factory, {"<channel|>": [101]})
+        scheduler._resolve_think_close_pattern = (
+            Scheduler._resolve_think_close_pattern.__get__(scheduler, Scheduler)
+        )
+        scheduler.tokenizer.think_end = None
+        scheduler._get_chat_template_text = MagicMock(return_value="no close marker")
+        request = self._make_request()
+
+        _, processors = scheduler._build_sampler_and_processors(
+            request.sampling_params, request
+        )
+
+        budget_processors = [
+            p for p in processors if isinstance(p, ThinkingBudgetProcessor)
+        ]
+        assert len(budget_processors) == 1
+        assert budget_processors[0]._think_end_ids == [101]
+
+    def test_harmony_uses_parser_thinking_close_and_final_header(self):
+        final_header = "<|start|>assistant<|channel|>final<|message|>"
+        factory = OutputParserFactory(
+            kind="harmony",
+            create_session=MagicMock(),
+            thinking_end_text="<|end|>",
+            thinking_end_trailing_text=final_header,
+        )
+        scheduler = self._make_scheduler(
+            factory,
+            {
+                "<|end|>": [200],
+                final_header: [201, 202, 203, 204, 205],
+            },
+        )
+        request = self._make_request()
+        request.is_harmony_model = True
+
+        _, processors = scheduler._build_sampler_and_processors(
+            request.sampling_params, request
+        )
+
+        budget_processors = [
+            p for p in processors if isinstance(p, ThinkingBudgetProcessor)
+        ]
+        assert len(budget_processors) == 1
+        assert budget_processors[0]._think_end_ids == [200]
+        assert budget_processors[0]._force_sequence == [200, 201, 202, 203, 204, 205]
 
 
 # ---------------------------------------------------------------------------

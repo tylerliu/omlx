@@ -1521,9 +1521,9 @@ class Scheduler:
         if self._generation_config_eos is not None:
             stop_tokens.update(self._generation_config_eos)
 
-        # Add protocol-specific stop tokens (e.g. Harmony action stops)
-        if self._output_parser_factory is not None:
-            stop_tokens.update(self._output_parser_factory.stop_token_ids)
+        # Protocol parsers need to observe their own stop tokens so they can
+        # apply channel-aware handling (for example, Harmony analysis end
+        # should continue into the final channel).
 
         return stop_tokens
 
@@ -2879,15 +2879,22 @@ class Scheduler:
         if (
             sampling_params.thinking_budget is not None
             and request is not None
-            and getattr(request, "needs_think_prefix", False)
-            and not getattr(request, "is_harmony_model", False)
+            and (
+                getattr(request, "needs_think_prefix", False)
+                or self._get_output_parser_thinking_end_text() is not None
+            )
         ):
             think_end_ids = self._resolve_think_end_token_ids()
             if think_end_ids:
                 from .api.thinking import ThinkingBudgetProcessor
 
                 think_start_id = self._get_think_token_id("think_start_id")
-                leading_ids, trailing_ids = self._resolve_think_close_pattern()
+                leading_ids, trailing_ids = self._resolve_think_close_pattern(
+                    self._get_output_parser_thinking_end_text()
+                )
+                parser_trailing_ids = self._resolve_output_parser_thinking_trailing_ids()
+                if parser_trailing_ids is not None:
+                    trailing_ids = parser_trailing_ids
                 processor = ThinkingBudgetProcessor(
                     think_end_token_ids=think_end_ids,
                     budget=sampling_params.thinking_budget,
@@ -2942,12 +2949,51 @@ class Scheduler:
         except (ValueError, TypeError):
             return None
 
+    def _get_output_parser_thinking_end_text(self) -> str | None:
+        """Return parser-provided thinking close text, if the parser has one."""
+        factory = getattr(self, "_output_parser_factory", None)
+        if factory is None:
+            return None
+        return getattr(factory, "thinking_end_text", None)
+
+    def _encode_thinking_marker(self, text: str) -> list[int] | None:
+        """Encode a parser/tokenizer thinking marker into token IDs."""
+        try:
+            ids = self.tokenizer.encode(text, add_special_tokens=False)
+        except TypeError:
+            try:
+                ids = self.tokenizer.encode(text)
+            except Exception:
+                return None
+        except Exception:
+            return None
+
+        if ids:
+            return list(ids)
+        return None
+
+    def _resolve_output_parser_thinking_trailing_ids(self) -> list[int] | None:
+        """Resolve parser-provided tokens that should follow a forced close."""
+        factory = getattr(self, "_output_parser_factory", None)
+        if factory is None:
+            return None
+
+        trailing_text = getattr(factory, "thinking_end_trailing_text", None)
+        if not trailing_text:
+            return None
+
+        return self._encode_thinking_marker(trailing_text)
+
     def _resolve_think_end_token_ids(self) -> list[int] | None:
         """Resolve token ID(s) for the close-think tag.
 
         Uses mlx-lm's built-in think_end_id which supports both
         </think> and </longcat_think> automatically.
         """
+        parser_think_end = self._get_output_parser_thinking_end_text()
+        if parser_think_end is not None:
+            return self._encode_thinking_marker(parser_think_end)
+
         # Tier 1: mlx-lm tokenizer attribute (covers all known think variants)
         think_end_id = self._get_think_token_id("think_end_id")
         if think_end_id is not None:
@@ -2972,7 +3018,9 @@ class Scheduler:
 
         return None
 
-    def _resolve_think_close_pattern(self) -> tuple[list[int] | None, list[int] | None]:
+    def _resolve_think_close_pattern(
+        self, think_end_str: str | None = None
+    ) -> tuple[list[int] | None, list[int] | None]:
         """Detect leading/trailing tokens around </think> from the chat template.
 
         Different models use different patterns:
@@ -2985,7 +3033,8 @@ class Scheduler:
         """
         import re
 
-        think_end_str = getattr(self.tokenizer, "think_end", "</think>")
+        if think_end_str is None:
+            think_end_str = getattr(self.tokenizer, "think_end", None) or "</think>"
 
         # Try to get the chat template text
         template_text = self._get_chat_template_text()
@@ -5652,6 +5701,7 @@ class Scheduler:
                 if parser_result.is_stop and not is_finished:
                     is_finished = True
                     is_stop = True
+                    response.finish_reason = "stop"
 
                 should_record_token = (
                     parser_result.record_token
@@ -5953,7 +6003,13 @@ class Scheduler:
                                     if pre_eval_arrays:
                                         mx.async_eval(*pre_eval_arrays)
 
-                            if self._store_cache_executor is not None:
+                            parser_backed_output = (
+                                self._output_parser_factory is not None
+                            )
+                            if (
+                                self._store_cache_executor is not None
+                                and not parser_backed_output
+                            ):
                                 # Hand the store-cache write to the background
                                 # executor without ever blocking the generation
                                 # step. The gate only counts in-flight writes;
