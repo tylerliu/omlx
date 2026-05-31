@@ -81,8 +81,8 @@ class TestThinkingBudgetProcessor:
         assert target_logit == 0.0
         assert other_logit == float("-inf")
 
-    def test_enters_suppression_after_forcing(self):
-        """After forcing </think>, processor should suppress duplicate end tokens."""
+    def test_done_after_forced_sequence(self):
+        """After forcing the close sequence, processor should become a no-op."""
         proc = self._make_processor(budget=1)
 
         # Call 1 (first_call): budget=1, forcing starts → forces THINK_END_ID
@@ -90,13 +90,11 @@ class TestThinkingBudgetProcessor:
         assert proc._forcing
         assert forced_logits[0, self.THINK_END_ID].item() == 0.0
 
-        # Call 2: force_sequence has only [THINK_END_ID] (no trailing), so
-        # _force_idx advances to 1 == len([42]) → enters suppression
+        # Call 2: force_sequence has only [THINK_END_ID], so the processor is done.
         logits = proc(_make_tokens(10, self.THINK_END_ID), _make_logits())
-        assert proc._suppress_end
-        assert not proc._done
-        # The end token should be suppressed (-inf)
-        assert logits[0, self.THINK_END_ID].item() == float("-inf")
+        assert proc._done
+        assert not proc._forcing
+        assert mx.array_equal(logits, _make_logits())
 
     def test_trailing_tokens_forced_after_end(self):
         """Trailing tokens (e.g. \\n) should be forced after </think>."""
@@ -113,10 +111,10 @@ class TestThinkingBudgetProcessor:
         assert proc._forcing
         assert logits1[0, self.NEWLINE_ID].item() == 0.0
 
-        # Call 3: _force_idx advances to 2 == len([42, 99]) → suppression
+        # Call 3: _force_idx advances to 2 == len([42, 99]) → done
         logits2 = proc(_make_tokens(10, self.THINK_END_ID, self.NEWLINE_ID), _make_logits())
-        assert proc._suppress_end
-        assert logits2[0, self.THINK_END_ID].item() == float("-inf")
+        assert proc._done
+        assert mx.array_equal(logits2, _make_logits())
 
     def test_natural_end_before_budget(self):
         """If model produces </think> naturally, processor becomes no-op."""
@@ -167,13 +165,40 @@ class TestThinkingBudgetProcessor:
         assert proc._forcing
         assert logits2[0, 52].item() == 0.0
 
-        # Call 4: _force_idx advances to 3 == len(end_ids), enters suppression
+        # Call 4: _force_idx advances to 3 == len(end_ids), then becomes done.
         logits3 = proc(_make_tokens(10, 50, 51, 52), _make_logits())
-        assert proc._suppress_end
-        assert not proc._done
-        # All end tokens suppressed
-        for tid in end_ids:
-            assert logits3[0, tid].item() == float("-inf")
+        assert proc._done
+        assert not proc._forcing
+        assert mx.array_equal(logits3, _make_logits())
+
+    def test_waits_for_utf8_completion_before_forcing(self):
+        """Budget exhaustion waits until the current token piece is UTF-8 complete."""
+        pieces = {
+            20: b"\xe2",
+            21: b"\x82",
+            22: b"\xac",
+        }
+        proc = ThinkingBudgetProcessor(
+            think_end_token_ids=[self.THINK_END_ID],
+            budget=2,
+            think_start_token_id=self.THINK_START_ID,
+            token_to_piece=lambda token_id: pieces.get(token_id, "x"),
+        )
+
+        proc(_make_tokens(10), _make_logits())
+        logits = proc(_make_tokens(10, 20), _make_logits())
+        assert proc._waiting_utf8
+        assert not proc._forcing
+        assert mx.array_equal(logits, _make_logits())
+
+        logits = proc(_make_tokens(10, 20, 21), _make_logits())
+        assert proc._waiting_utf8
+        assert not proc._forcing
+        assert mx.array_equal(logits, _make_logits())
+
+        logits = proc(_make_tokens(10, 20, 21, 22), _make_logits())
+        assert proc._forcing
+        assert logits[0, self.THINK_END_ID].item() == 0.0
 
     def test_multi_token_natural_detection(self):
         """Sliding window should detect multi-token </think> naturally."""
@@ -260,6 +285,9 @@ class TestParserBackedThinkingBudgetWiring:
         scheduler._encode_thinking_marker = Scheduler._encode_thinking_marker.__get__(
             scheduler, Scheduler
         )
+        scheduler._token_piece_to_bytes = Scheduler._token_piece_to_bytes.__get__(
+            scheduler, Scheduler
+        )
         scheduler._resolve_output_parser_thinking_trailing_ids = (
             Scheduler._resolve_output_parser_thinking_trailing_ids.__get__(
                 scheduler, Scheduler
@@ -333,6 +361,10 @@ class TestParserBackedThinkingBudgetWiring:
         ]
         assert len(budget_processors) == 1
         assert budget_processors[0]._think_end_ids == [101]
+
+    def test_token_piece_to_bytes_handles_sentencepiece_byte_fallback(self):
+        scheduler = self._make_scheduler(None, {})
+        assert scheduler._token_piece_to_bytes("<0xE2><0x82><0xAC>") == "€".encode()
 
     def test_harmony_uses_parser_thinking_close_and_final_header(self):
         final_header = "<|start|>assistant<|channel|>final<|message|>"

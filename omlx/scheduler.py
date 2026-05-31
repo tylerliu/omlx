@@ -2901,6 +2901,7 @@ class Scheduler:
                     think_start_token_id=think_start_id,
                     leading_token_ids=leading_ids,
                     trailing_token_ids=trailing_ids,
+                    token_to_piece=self._thinking_budget_token_to_piece,
                 )
                 logits_processors.append(processor)
 
@@ -2970,6 +2971,46 @@ class Scheduler:
 
         if ids:
             return list(ids)
+        return None
+
+    def _thinking_budget_token_to_piece(self, token_id: int) -> str | bytes | None:
+        """Best-effort token piece lookup for UTF-8-safe budget forcing."""
+        try:
+            token = self.tokenizer.convert_ids_to_tokens(token_id)
+            if token is not None:
+                byte_piece = self._token_piece_to_bytes(token)
+                return byte_piece if byte_piece is not None else token
+        except (AttributeError, KeyError, TypeError, ValueError):
+            pass
+
+        try:
+            return self.tokenizer.decode([token_id], skip_special_tokens=False)
+        except TypeError:
+            try:
+                return self.tokenizer.decode([token_id])
+            except Exception:
+                return None
+        except Exception:
+            return None
+
+    def _token_piece_to_bytes(self, token: str) -> bytes | None:
+        """Convert byte-fallback tokenizer pieces to raw bytes when possible."""
+        import re
+
+        byte_fallback = re.fullmatch(r"(?:<0x[0-9A-Fa-f]{2}>)+", token)
+        if byte_fallback is not None:
+            return bytes(
+                int(match.group(1), 16)
+                for match in re.finditer(r"<0x([0-9A-Fa-f]{2})>", token)
+            )
+
+        byte_decoder = getattr(self.tokenizer, "byte_decoder", None)
+        if isinstance(byte_decoder, dict) and token:
+            try:
+                return bytes(byte_decoder[ch] for ch in token)
+            except (KeyError, TypeError, ValueError):
+                pass
+
         return None
 
     def _resolve_output_parser_thinking_trailing_ids(self) -> list[int] | None:
@@ -6003,13 +6044,7 @@ class Scheduler:
                                     if pre_eval_arrays:
                                         mx.async_eval(*pre_eval_arrays)
 
-                            parser_backed_output = (
-                                self._output_parser_factory is not None
-                            )
-                            if (
-                                self._store_cache_executor is not None
-                                and not parser_backed_output
-                            ):
+                            if self._store_cache_executor is not None:
                                 # Hand the store-cache write to the background
                                 # executor without ever blocking the generation
                                 # step. The gate only counts in-flight writes;
