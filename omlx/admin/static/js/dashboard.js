@@ -103,6 +103,8 @@
             },
             savingModelSettings: false,
             loadingGenDefaults: false,
+            modelSettingsThinkingBudgetBeforeInput: null,
+            modelSettingsThinkingBudgetStepping: false,
             reasoningParsers: [],
 
             // Profile / template / preset state
@@ -995,6 +997,55 @@
             },
 
             // ===== Profiles / Templates =====
+            normalizeThinkingBudgetTokens(value, fallback = 4096) {
+                if (value === '' || value == null) return fallback;
+                const n = Number(value);
+                if (!Number.isFinite(n)) return fallback;
+                if (n <= 0) return 1;
+                return Math.floor(n);
+            },
+
+            stepModelSettingsThinkingBudget(direction) {
+                if (!this.modelSettings.enableThinkingBudget) return;
+                let v = Number(this.modelSettings.thinking_budget_tokens);
+                if (!Number.isFinite(v) || v <= 0) v = 4096;
+                this.modelSettings.thinking_budget_tokens = direction > 0
+                    ? Math.max(1, Math.floor(v * 2))
+                    : Math.max(1, Math.floor(v / 2));
+                this.modelSettingsThinkingBudgetBeforeInput = this.modelSettings.thinking_budget_tokens;
+            },
+
+            onModelSettingsThinkingBudgetInput(event) {
+                if (this.modelSettingsThinkingBudgetStepping) return;
+                const el = event.target;
+                const rawValue = el.value;
+                const raw = Number(rawValue);
+                const prev = Number(this.modelSettingsThinkingBudgetBeforeInput);
+                const fromTextEdit = typeof event.inputType === 'string' && event.inputType.length > 0;
+                if (!fromTextEdit && Number.isFinite(prev) && Number.isFinite(raw) && raw !== prev) {
+                    const delta = raw - prev;
+                    if (delta !== 0) {
+                        this.modelSettingsThinkingBudgetStepping = true;
+                        this.modelSettings.thinking_budget_tokens = prev;
+                        this.stepModelSettingsThinkingBudget(delta > 0 ? 1 : -1);
+                        el.value = this.modelSettings.thinking_budget_tokens;
+                        this.modelSettingsThinkingBudgetBeforeInput = this.modelSettings.thinking_budget_tokens;
+                        this.modelSettingsThinkingBudgetStepping = false;
+                        return;
+                    }
+                }
+                this.modelSettingsThinkingBudgetBeforeInput = rawValue;
+                this.modelSettings.thinking_budget_tokens = rawValue;
+            },
+
+            clampModelSettingsThinkingBudget() {
+                if (!this.modelSettings.enableThinkingBudget) return;
+                this.modelSettings.thinking_budget_tokens = this.normalizeThinkingBudgetTokens(
+                    this.modelSettings.thinking_budget_tokens
+                );
+                this.modelSettingsThinkingBudgetBeforeInput = this.modelSettings.thinking_budget_tokens;
+            },
+
             formValuesForProfile() {
                 const ms = this.modelSettings;
                 const out = {};
@@ -1002,7 +1053,9 @@
                 for (const k of this.profileFields.universal.concat(this.profileFields.model_specific)) {
                     if (k === 'chat_template_kwargs' || k === 'forced_ct_kwargs') continue;  // handle below
                     if (k === 'thinking_budget_enabled') {
-                        if (ms.enableThinkingBudget) out.thinking_budget_tokens = ms.thinking_budget_tokens ?? null;
+                        if (ms.enableThinkingBudget) {
+                            out.thinking_budget_tokens = this.normalizeThinkingBudgetTokens(ms.thinking_budget_tokens);
+                        }
                         continue;
                     }
                     if (k === 'index_cache_freq') {
@@ -1665,7 +1718,7 @@
                                 enable_thinking: this.modelSettings.enable_thinking,
                                 thinking_budget_enabled: this.modelSettings.enableThinkingBudget,
                                 thinking_budget_tokens: this.modelSettings.enableThinkingBudget
-                                    ? (this.modelSettings.thinking_budget_tokens || null)
+                                    ? this.normalizeThinkingBudgetTokens(this.modelSettings.thinking_budget_tokens)
                                     : 0,
                                 max_tool_result_tokens: this.modelSettings.enableToolResultLimit
                                     ? (this.modelSettings.max_tool_result_tokens || null)
